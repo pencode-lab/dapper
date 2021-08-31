@@ -96,6 +96,21 @@
 #ifndef BACKLOG
 #define BACKLOG 20		/*listen(fd, backlog) */
 #endif
+#ifndef MAX_SOCKS_BUFFER
+#define MTU 1250
+#define MAX_SOCKS_BUFFER ((int)sysconf(_SC_PAGESIZE))
+#endif
+#ifndef REMOTE_CLOSED
+#define REMOTE_CLOSED 0x101
+#endif
+
+#define MAX(x,y) ({\
+	__typeof__(x) _x = x; \
+	__typeof__(y) _y = y; \
+	(void) ( &_x == &_y ); \
+	_x>_y ? _x : _y;\
+})
+
 
 
 
@@ -122,6 +137,22 @@ typedef union {
   struct sockaddr_in6 sa6;         /* IPv6 */
   struct sockaddr_storage sas;     /* Should be the maximum of the above 3 */
 } address;
+
+/*
+**
+**
+**
+*/
+static size_t forward_to_fd(int fd,char *src,size_t len)
+{
+    size_t n = write(fd,src,len);
+    if(n==-1){
+        /*the data written to the tun/tap interface should be a valid pkt/frame*/
+        fprintf(stderr,"need write to tun[%ld],but failed:%s\n",len,strerror(errno));
+    }
+    return n;
+}
+
 
 /*
 ** Implement an ws server daemon listening on port sPort.
@@ -262,6 +293,139 @@ int ws_server(const char *sPort, int localOnly){
 	exit(1);
 }
 
+int process_one_client(const char *program)
+{
+	int pipe_write_fd[2]; /*parent write to child(program) data pipe*/
+	int pipe_read_fd[2];  /*parent read from child(program) data pipe*/
+
+	int socket_read_fd =0;
+	int socket_write_fd =1;
+
+	fd_set readfds;
+    struct timeval tv;
+    int nfds =0;
+    int nready;
+    int done=0;
+    char socks_buffer[MAX_SOCKS_BUFFER];
+	int rtn;
+
+
+	do{
+
+		/*pipe create*/
+
+		if(pipe(pipe_write_fd)){
+			/*log */
+			done =1;
+			break;
+		}
+
+		if(pipe(pipe_read_fd)){
+			/*log*/
+			close(pipe_write_fd[0]);
+			close(pipe_write_fd[1]);
+			done =1;
+			break;
+		}
+		
+
+		/*fork child exec program*/
+
+		if( fork()==0 ){/*in child*/
+			/*parent use pipe_write_fd[1]  -> write to -> child, means child from pipe_write_fd[0] read data*/
+			close(0);
+			close(pipe_write_fd[1]);
+			if( dup2(pipe_write_fd[0], 0)!=0 ){
+				/*log*/
+				exit(errno);
+			}
+			close(pipe_write_fd[0]);
+
+			/*parent use pipe_read_fd[0]  <- read data from child, means child wirte data to  pipe_read_fd[1]*/
+
+			close(1);
+			close(pipe_read_fd[0]);
+			if( dup2(pipe_read_fd[1],1)!=1 ){
+				/*log*/
+				exit(errno);
+			}
+			close(pipe_read_fd[1]);
+
+			int i;
+			for( i=3; close(i)==0; i++){}
+			execl(program, program, (char*)0);
+
+			/*if execl fail...*/
+			fprintf(stderr,"child will exit .....\n");
+			exit(errno);
+		}
+
+		/*in parent close */
+		close(pipe_read_fd[1]);
+		close(pipe_write_fd[0]);
+
+	}while(0);
+
+
+	/* int parent
+     * wait for sockets to become readable and forward data
+     *
+     */
+
+	while(!done){
+
+		do{
+			tv.tv_sec = 1000;
+            tv.tv_usec = 0;
+			FD_ZERO(&readfds);
+
+			FD_SET(pipe_read_fd[0], &readfds);
+            nfds = MAX(nfds, pipe_read_fd[0]);
+
+			FD_SET(socket_read_fd, &readfds);
+            nfds = MAX(nfds, socket_read_fd);
+
+		}while ( ( nready=select(nfds+1, &readfds, NULL, NULL, &tv) ) == -1 && errno == EINTR);
+
+
+		/*read from pipe */
+        if (FD_ISSET(pipe_read_fd[0], &readfds)) {
+			ssize_t rret;
+			while ((rret = read(pipe_read_fd[0], socks_buffer, sizeof(socks_buffer))) == -1 && errno == EINTR)
+                ;
+			if(rret ==0) {
+				/*pipe close*/
+				close(pipe_read_fd[0]);
+				close(socket_write_fd);
+				done =REMOTE_CLOSED; 
+			}else{
+				rret = forward_to_fd(socket_write_fd,socks_buffer,rret);
+			}
+		}
+
+		/*read from sock*/
+		if (FD_ISSET(socket_read_fd, &readfds)) {
+			ssize_t rret;
+            while ((rret = read(socket_read_fd, socks_buffer, sizeof(socks_buffer))) == -1 && errno == EINTR)
+                ;
+            if(rret ==0) {
+                /*fd close*/
+				close(socket_read_fd);
+				close(pipe_write_fd[1]);
+				done =REMOTE_CLOSED;
+            }else{
+                rret = forward_to_fd(pipe_write_fd[1],socks_buffer,rret);
+            }
+        }
+
+	}
+
+	wait(&rtn);
+	/*log: request close*/
+    return 0;
+
+}
+
 
 int processClient(const char *program)
 {
@@ -368,7 +532,7 @@ int processClient(const char *program)
 int main(int argc, char **argv){
 
     const char *sPort = 0;  
-	const char *program = "./test.sh";
+	const char *program = "./test1.sh";
 
 	sPort = DEFAULT_PORT;
 
@@ -379,7 +543,8 @@ int main(int argc, char **argv){
 
 
 	/*in child do*/
-	processClient(program);
+	process_one_client(program);
+	//processClient(program);
 
     exit(0);
 }
