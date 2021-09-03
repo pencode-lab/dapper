@@ -103,6 +103,9 @@
 #ifndef REMOTE_CLOSED
 #define REMOTE_CLOSED 0x101
 #endif
+#ifndef CONN_ESTABLISHED
+#define CONN_ESTABLISHED 0
+#endif
 
 #define MAX(x,y) ({\
 	__typeof__(x) _x = x; \
@@ -119,9 +122,10 @@
 ** saves having to pass information to subroutines as parameters, and
 ** makes the executable smaller...
 */
-static char *sRoot = 0;          /* Root directory of the website */
+static char *zRoot = 0;          /* Root directory of the website */
 static int ipv6Only = 0;         /* Use IPv6 only */
 static int ipv4Only = 0;         /* Use IPv4 only */
+
 
 
 
@@ -139,23 +143,26 @@ typedef union {
 } address;
 
 /*
+**Write data to fd
 **
-**
-**
+**return if success 0 else return -1
 */
-static size_t forward_to_fd(int fd,char *src,size_t len)
+static int forward_to_fd(int fd,char *src,size_t len)
 {
+	int rc =0;
+
     size_t n = write(fd,src,len);
-    if(n==-1){
-        /*the data written to the tun/tap interface should be a valid pkt/frame*/
-        fprintf(stderr,"need write to tun[%ld],but failed:%s\n",len,strerror(errno));
-    }
-    return n;
+
+	if(n==-1 && !(errno == EAGAIN || errno == EWOULDBLOCK)){
+			rc =-1;
+	}
+
+    return rc;
 }
 
 
 /*
-** Implement an ws server daemon listening on port sPort.
+** Implement an ws server daemon listening on port zPort.
 **
 ** As new connections arrive, fork a child and let the child return
 ** out of this procedure call.  The child will handle the request.
@@ -164,7 +171,7 @@ static size_t forward_to_fd(int fd,char *src,size_t len)
 ** Return 0 to each child as it runs.  If unable to establish a
 ** listening socket, return non-zero.
 */
-int ws_server(const char *sPort, int localOnly){
+int ws_server(const char *zPort, int localOnly){
 	int listener[20];            /* The server sockets */
 	int connection;              /* A socket for each individual connection */
 	fd_set readfds;              /* Set of file descriptors for select() */
@@ -193,7 +200,7 @@ int ws_server(const char *sPort, int localOnly){
 	sHints.ai_socktype = SOCK_STREAM;
 	sHints.ai_flags = AI_PASSIVE; /*for bind()*/
 	sHints.ai_protocol = 0;
-	rc = getaddrinfo(localOnly ? "localhost": 0, sPort, &sHints, &pAddrs);
+	rc = getaddrinfo(localOnly ? "localhost": 0, zPort, &sHints, &pAddrs);
 	if( rc ){
 		fprintf(stderr, "could not get addr info: %s",
             rc!=EAI_SYSTEM ? gai_strerror(rc) : strerror(errno));
@@ -263,8 +270,7 @@ int ws_server(const char *sPort, int localOnly){
 					if( child!=0 ){
 						if( child>0 ) nchildren++;
 						close(connection);
-						/* printf("subprocess %d started...\n", child); fflush(stdout); */
-					}else{
+					}else{ /*child*/
 						int nErr = 0, fd;
 						close(0);
 						fd = dup(connection);
@@ -287,25 +293,72 @@ int ws_server(const char *sPort, int localOnly){
 	}
 
 
-
-
 	/* NOT REACHED */  
 	exit(1);
 }
 
-int process_one_client(const char *program)
+/*
+**websocket  has two parts: a handshake and the data transfer.
+**
+**The handshake from the client looks as follows:
+**
+**       GET /chat HTTP/1.1
+**        Host: server.example.com
+**        Upgrade: websocket
+**        Connection: Upgrade
+**        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+**        Origin: http://example.com
+**        Sec-WebSocket-Protocol: chat, superchat
+**        Sec-WebSocket-Version: 13
+**
+**
+**The handshake from the server looks as follows:
+**
+**        HTTP/1.1 101 Switching Protocols
+**        Upgrade: websocket
+**        Connection: Upgrade
+**        Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+**        Sec-WebSocket-Protocol: chat
+**
+**This routine processes a websocket request on standard input and
+** sends the reply to standard output.
+**return: if error return -1 else return 0
+**when success, zOut is will exec program
+*/
+int opening_handshaker(char *zOut)
+{
+	char zLine[1024];
+	/* Get the first line of the request and parse out the
+	** method, the script and the protocol.
+	*/
+	if( fgets(zLine,sizeof(zLine),stdin)==0 ){
+		exit(0);
+	}
+
+}
+
+/*
+** This routine processes a single websocket request on standard input and
+** sends the reply to standard output.  
+**
+** If the connection should be closed, this routine calls exit() and
+** thus never returns.  If this routine does return it means that another
+** websocket request may appear on the wire.
+*/
+
+int process_one_client(char **program)
 {
 	int pipe_write_fd[2]; /*parent write to child(program) data pipe*/
 	int pipe_read_fd[2];  /*parent read from child(program) data pipe*/
 
-	int socket_read_fd =0;
-	int socket_write_fd =1;
+	int socket_read_fd =fileno(stdin); /*read from stdin*/
+	int socket_write_fd =fileno(stdout); /*write to stdout*/
 
-	fd_set readfds;
+	fd_set readfds,dumpfds;
     struct timeval tv;
     int nfds =0;
     int nready;
-    int done=0;
+    int status=REMOTE_CLOSED;
     char socks_buffer[MAX_SOCKS_BUFFER];
 	int rtn;
 
@@ -316,7 +369,6 @@ int process_one_client(const char *program)
 
 		if(pipe(pipe_write_fd)){
 			/*log */
-			done =1;
 			break;
 		}
 
@@ -324,7 +376,6 @@ int process_one_client(const char *program)
 			/*log*/
 			close(pipe_write_fd[0]);
 			close(pipe_write_fd[1]);
-			done =1;
 			break;
 		}
 		
@@ -353,7 +404,7 @@ int process_one_client(const char *program)
 
 			int i;
 			for( i=3; close(i)==0; i++){}
-			execl(program, program, (char*)0);
+			execvp(program[0],program);
 
 			/*if execl fail...*/
 			fprintf(stderr,"child will exit .....\n");
@@ -363,6 +414,7 @@ int process_one_client(const char *program)
 		/*in parent close */
 		close(pipe_read_fd[1]);
 		close(pipe_write_fd[0]);
+		status = CONN_ESTABLISHED;
 
 	}while(0);
 
@@ -371,35 +423,41 @@ int process_one_client(const char *program)
      * wait for sockets to become readable and forward data
      *
      */
+	tv.tv_sec = 1000;
+	tv.tv_usec = 0;
 
-	while(!done){
+    FD_ZERO(&dumpfds);
+
+    FD_SET(pipe_read_fd[0], &dumpfds);
+    nfds = MAX(nfds, pipe_read_fd[0]);
+
+    FD_SET(socket_read_fd, &dumpfds);
+    nfds = MAX(nfds, socket_read_fd);
+
+	while(status != REMOTE_CLOSED){
 
 		do{
-			tv.tv_sec = 1000;
-            tv.tv_usec = 0;
-			FD_ZERO(&readfds);
-
-			FD_SET(pipe_read_fd[0], &readfds);
-            nfds = MAX(nfds, pipe_read_fd[0]);
-
-			FD_SET(socket_read_fd, &readfds);
-            nfds = MAX(nfds, socket_read_fd);
+			memcpy(&readfds,&dumpfds,sizeof(dumpfds));
 
 		}while ( ( nready=select(nfds+1, &readfds, NULL, NULL, &tv) ) == -1 && errno == EINTR);
-
 
 		/*read from pipe */
         if (FD_ISSET(pipe_read_fd[0], &readfds)) {
 			ssize_t rret;
 			while ((rret = read(pipe_read_fd[0], socks_buffer, sizeof(socks_buffer))) == -1 && errno == EINTR)
                 ;
-			if(rret ==0) {
+			if(rret ==0 || rret ==-1) {
 				/*pipe close*/
 				close(pipe_read_fd[0]);
 				close(socket_write_fd);
-				done =REMOTE_CLOSED; 
+				status =REMOTE_CLOSED; 
 			}else{
-				rret = forward_to_fd(socket_write_fd,socks_buffer,rret);
+				if(forward_to_fd(socket_write_fd,socks_buffer,rret)==-1){
+					close(pipe_read_fd[0]);
+					close(socket_write_fd);
+					status =REMOTE_CLOSED;
+				}
+
 			}
 		}
 
@@ -408,13 +466,17 @@ int process_one_client(const char *program)
 			ssize_t rret;
             while ((rret = read(socket_read_fd, socks_buffer, sizeof(socks_buffer))) == -1 && errno == EINTR)
                 ;
-            if(rret ==0) {
+            if(rret ==0 || rret ==-1) {
                 /*fd close*/
 				close(socket_read_fd);
 				close(pipe_write_fd[1]);
-				done =REMOTE_CLOSED;
+				status =REMOTE_CLOSED;
             }else{
-                rret = forward_to_fd(pipe_write_fd[1],socks_buffer,rret);
+               if(forward_to_fd(pipe_write_fd[1],socks_buffer,rret)==-1){
+				   close(socket_read_fd);
+	               close(pipe_write_fd[1]);
+		           status =REMOTE_CLOSED;
+			   }
             }
         }
 
@@ -427,124 +489,66 @@ int process_one_client(const char *program)
 }
 
 
-int processClient(const char *program)
-{
-	int px[2]; /*parent write to child pipe*/
-	int py[2]; /*parent read from child pipe*/
 
-	fd_set readfds, allset;
-	struct timeval delay;
-	int maxFd = -1;
-	char sLine[1024];
-	int nbyte,nready;
-	int n,i;
-	int rtn; 
-
-
-
-
-    if( pipe(px)){
-		printf("pipe faild\n");
-		return -1;
-    }
-
-	if(pipe(py)){
-		close(px[0]);
-		close(px[1]);
-		return -1;
-	}
-
-	if( fork()==0 ){
-
-		close(0);
-		close(px[1]);
-		if( dup2(px[0], 0)!=0 ){
-			fprintf(stderr,"error ...1\n");
-		}
-		close(px[0]);
-
-        close(1);
-		close(py[0]);
-        if( dup2(py[1],1)!=1 ){
-			fprintf(stderr,"dup err..\n");
-        }
-        close(py[1]);
-
-        for(i=3; close(i)==0; i++){}
-        execl(program, program, (char*)0);
-
-		/*if execl fail...*/
-        exit(errno);
-	}
-
-
-	/**parent**/
-	close(px[0]);
-	close(py[1]);
-
-	delay.tv_sec = 3;
-    delay.tv_usec = 0;
-
-	FD_ZERO(&readfds);
-	FD_ZERO(&allset);
-
-	FD_SET(py[0], &allset);
-    if(py[0] > maxFd) maxFd = py[0];
-
-    FD_SET(0, &allset);
-	if(0 > maxFd) maxFd = 0;
-	
-	while(1){
-
-		memcpy(&readfds,&allset,sizeof(allset));
-
-		nready = select( maxFd+1, &readfds, 0, 0, &delay);
-		if((nready == -1) && (errno !=EINTR)) {
-			break;
-		}
-
-		if( FD_ISSET(py[0], &readfds)) {
-			nbyte = read(py[0],sLine,sizeof(sLine));
-			if(nbyte <=0) {
-				close(py[0]);
-			}else {
-				nbyte = write(1,sLine,nbyte);
-			}
-		}
-		if( FD_ISSET(0, &readfds)) {
-			nbyte = read(0,sLine,sizeof(sLine));
-			if(nbyte <=0) {
-                close(px[1]);
-			}else{
-				nbyte = write(px[1],sLine,nbyte);
-			}
-        }
-	}
-
-	wait(&rtn);
-    fprintf(stderr, " child process return %d\n", rtn );
-	return 0;
-	
-}
-
-
-
+/*
+** $ wsdapper --port=8080 my-program
+*/
 int main(int argc, char **argv){
 
-    const char *sPort = 0;  
-	const char *program = "./test1.sh";
+    const char *zPort = 0;  
+	const char *zStaticDir=0;
+	char **program=0;
 
-	sPort = DEFAULT_PORT;
+	zPort = DEFAULT_PORT;
+
+	/* Parse command-line arguments
+	*/
+	while( argc>1 && argv[1][0]=='-' ){
+		char *z = argv[1];
+		char *zArg = argc>=3 ? argv[2] : "0";	
+		if( z[0]=='-' && z[1]=='-' ) z++;
+		
+		if( strcmp(z,"-port")==0 ){
+			zPort = zArg;
+			fprintf(stderr,"sport = %s\n",zPort);
+
+        }else if(strcmp(z,"-static")==0){
+			zStaticDir = zArg;			
+			fprintf(stderr,"static dir = %s\n",zStaticDir);
+
+		}else{
+			fprintf(stderr,"unknown argument: [%s]\n", z);
+			exit(0);
+		}
+		argv += 2;
+		argc -= 2;
+	}
+
+	if(argc>1 && *argv){
+		program = ++argv;
+		char **p=program;
+
+		fprintf(stderr,"will exec program[");
+		while(*p){
+			fprintf(stderr," %s",*p++);
+		}
+		fprintf(stderr,"]\n");
+
+
+	}else{
+		fprintf(stderr,"unknown exec program(NULL)\n");
+		exit(0);
+	}
+
 
     /* Activate the server, if requested */
-    if( sPort && ws_server(sPort, 0) ){
+    if( zPort && ws_server(zPort, 0) ){
         /* failed*/
     }
 
 
 	/*in child do*/
 	process_one_client(program);
-	//processClient(program);
 
     exit(0);
 }
